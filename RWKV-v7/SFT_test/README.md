@@ -95,7 +95,8 @@ Outputs (under `--save_dir`):
 | `--save_every` | 200 | save interval in optimizer steps |
 | `--log_every` | 10 | log interval (loss, lr, tok/s) |
 | `--resume` | — | path to `ckpt-latest.pt` |
-| `--compile` | off | torch.compile the WKV step |
+| `--compile` | off | torch.compile the WKV step (python path only) |
+| `--cuda_kernel` | off | use the wind_backstepping fp32 CUDA kernel. **Turn this on if you want speed** |
 | `--fsdp` | off | requires torchrun (see below) |
 | `--grad_ckpt` | off | per-block activation checkpointing |
 | `--tf32` | off | allow tf32 matmul. **Turning this on makes it no longer strict fp32** — leave off for reproducibility experiments, turn on if you only want speed. |
@@ -113,6 +114,35 @@ Outputs (under `--save_dir`):
 - Recompiles on shape change. Batch size is fixed via `drop_last=True`, so you usually compile
   once — but **resuming with a different `--batch_size` or `--max_len` triggers a recompile**
   (harmless).
+
+---
+
+## 5-1. CUDA kernel (`--cuda_kernel`) — the real speedup
+
+The wind_backstepping kernel (forward + backward, `typedef bf = float`, i.e. **pure fp32**)
+is hardcoded into the script as source strings. With `--cuda_kernel` it is JIT-compiled via
+`load_inline` and replaces the naive python loop.
+
+```bash
+python train_rwkv7.py --model ... --data ... --max_len 512 --cuda_kernel
+```
+
+- **Requirements**: CUDA GPU + nvcc (CUDA toolkit), and `--max_len` must be a **multiple of 16**
+  (the kernel's `_CHUNK_LEN_=16`; not a real constraint for typical 512/1024 lengths).
+- First run compiles for 1–2 minutes; afterwards it loads instantly from the torch extension
+  cache (`~/.cache/torch_extensions`).
+- **Speed**: tens of times faster than the naive loop. `--compile` is automatically ignored on
+  the kernel path (it only affects the python WKV step).
+- **Memory savings too**: backward keeps the state only every 16 steps and reconstructs the rest
+  by backstepping, so most of the memory concerns in section 8 disappear — you usually won't
+  need `--grad_ckpt`.
+- **Math identity**: the kernel takes decay as `exp(-exp(w))`; with the transform
+  `w = -softplus(-z) - 0.5` this is exactly identical to the python path's `exp(-sigmoid(z)/√e)`
+  (verified, max diff ~6e-8). Both paths start from the same `w_log`, so you can cross-check
+  results with the kernel on vs. off.
+- With FSDP, rank0 compiles first, then a barrier lets the other ranks load from cache — just
+  pass `--fsdp --cuda_kernel` together.
+- Kernel I/O is (B,T,H,64) contiguous fp32, mapped as `z = -kk`, `b = kk*a`.
 
 ---
 
