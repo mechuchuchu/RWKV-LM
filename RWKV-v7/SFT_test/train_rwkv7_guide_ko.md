@@ -91,7 +91,8 @@ effective batch = `batch_size × grad_accum × GPU수`. 위 예시면 8×4 = 32.
 | `--save_every` | 200 | optimizer step 기준 저장 주기 |
 | `--log_every` | 10 | 로그 주기 (loss, lr, tok/s) |
 | `--resume` | — | `ckpt-latest.pt` 경로 |
-| `--compile` | off | WKV step torch.compile |
+| `--compile` | off | WKV step torch.compile (python 경로 전용) |
+| `--cuda_kernel` | off | wind_backstepping fp32 CUDA 커널 사용. **속도 원하면 이걸 켤 것** |
 | `--fsdp` | off | torchrun 필요 (아래 참고) |
 | `--grad_ckpt` | off | block 단위 activation checkpointing |
 | `--tf32` | off | matmul tf32 허용. **켜면 strict fp32가 아니게 됨** — 재현성 실험이면 끄고, 속도만 원하면 켜기 |
@@ -105,6 +106,31 @@ effective batch = `batch_size × grad_accum × GPU수`. 위 예시면 8×4 = 32.
 - 그래서 가속 폭은 "조금" 수준 — python 오버헤드와 step 내부 커널 fusion 정도
 - 첫 forward가 컴파일 때문에 수십 초 걸리는 건 정상
 - shape이 바뀌면 재컴파일됨. `drop_last=True`로 배치 크기를 고정해놨으니 보통 1회 컴파일로 끝나지만, **도중에 `--batch_size`나 `--max_len`을 바꿔서 resume하면 다시 컴파일**됨 (동작엔 문제 없음)
+
+---
+
+## 5-1. CUDA 커널 (`--cuda_kernel`) — 진짜 가속
+
+wind_backstepping 커널(forward + backward, `typedef bf = float`라 **fp32 그대로**)을
+스크립트 안에 소스 문자열로 하드코딩해놨고, `--cuda_kernel` 주면 `load_inline`으로 JIT 컴파일해서
+naive python loop 대신 사용함.
+
+```bash
+python train_rwkv7.py --model ... --data ... --max_len 512 --cuda_kernel
+```
+
+- **요구사항**: CUDA GPU + nvcc(CUDA toolkit), 그리고 `--max_len`이 **16의 배수** (커널의
+  `_CHUNK_LEN_=16` 때문. 어차피 512, 1024 같은 값 쓸 테니 실질 제약 없음)
+- 첫 실행 시 컴파일에 1~2분 걸리고 이후엔 torch extension 캐시(`~/.cache/torch_extensions`)에서 즉시 로드
+- **속도**: naive loop 대비 수십 배. `--compile`은 커널 경로에선 의미 없어서 자동 무시됨
+- **메모리도 절약**: backward용 state를 매 timestep이 아니라 16스텝마다만 저장하고 나머지는
+  backward에서 역산(backstepping). 8절의 메모리 걱정이 대부분 사라짐 → `--grad_ckpt` 없이도 여유로움
+- **수식 동일성**: 커널은 decay를 `exp(-exp(w))`로 받는데, python 경로의
+  `exp(-sigmoid(z)/√e)`와 `w = -softplus(-z) - 0.5` 변형으로 정확히 항등 (max diff ~6e-8 확인).
+  두 경로 모두 같은 `w_log`에서 출발하므로 `--cuda_kernel` 켜고 끄고 결과 비교 검증도 가능
+- FSDP와 같이 쓸 때는 rank0이 먼저 컴파일하고 barrier 후 나머지가 캐시 로드하게 처리해놔서
+  그냥 `--fsdp --cuda_kernel` 같이 주면 됨
+- 커널 입출력은 (B,T,H,64) contiguous fp32, `z = -kk`, `b = kk*a`로 매핑되어 있음
 
 ---
 
