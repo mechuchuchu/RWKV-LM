@@ -1,90 +1,86 @@
 ########################################################################################################
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
+#
+# Model-definition-only version:
+#   plain PyTorch + CUDA kernels, NO pytorch_lightning, NO deepspeed, NO training loop.
+#   forward()  ->  logits.  That's it.
 ########################################################################################################
 
-import os, sys, math, gc, importlib
+import os, math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-import pytorch_lightning as pl
-from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
-from pytorch_lightning.strategies import DeepSpeedStrategy
-if importlib.util.find_spec('deepspeed'):
-    import deepspeed
-    from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+from torch.utils.cpp_extension import load
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
+from typing import Tuple
+from dataclasses import dataclass
 
-try:
-    print('RWKV_MY_TESTING', os.environ["RWKV_MY_TESTING"])
-except:
-    os.environ["RWKV_MY_TESTING"] = ''
-try:
-    print('RWKV_KERNEL', os.environ["RWKV_KERNEL"])
-except:
-    os.environ["RWKV_KERNEL"] = ''
+########################################################################################################
+# JIT toggle (optional). Set RWKV_JIT_ON=1 to compile the Tmix forward as a ScriptModule.
+########################################################################################################
 
 def __nop(ob):
     return ob
 
-
 MyModule = nn.Module
 MyFunction = __nop
-if os.environ["RWKV_JIT_ON"] == "1":
+if os.environ.get("RWKV_JIT_ON") == "1":
     MyModule = torch.jit.ScriptModule
     MyFunction = torch.jit.script_method
 
-########################################################################################################
-# CUDA Kernel
-########################################################################################################
+# sensible defaults so an unset env doesn't crash import
+os.environ.setdefault("RWKV_MY_TESTING", "x070")
+os.environ.setdefault("RWKV_KERNEL", "")
 
-from torch.utils.cpp_extension import load
-
-HEAD_SIZE = int(os.environ["RWKV_HEAD_SIZE"])
-
-if 'x070' in os.environ["RWKV_MY_TESTING"]:
-    CHUNK_LEN = 16
-    assert HEAD_SIZE == 64 # can change 64 to your HEAD_SIZE
-
-    # check https://github.com/BlinkDL/RWKV-CUDA/blob/main/rwkv7_fast_fused/rwkv7_cuda_benchmark.py
-    #
-    # use rwkv7_clampw_v3.cpp and rwkv7_clampw_v3_for_h100.cu for 20% faster fwd & bwd kernel on H100s and some consumer GPUS (for some Bsz*Headcount)
-    # note: sometimes rwkv7_clampw_v3_for_h100_alt is faster
-
-    flags = ['-res-usage', f'-D_N_={HEAD_SIZE}', f"-D_CHUNK_LEN_={CHUNK_LEN}", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"]
-    if "@rwkv3" in os.environ["RWKV_KERNEL"]:
-        RWKV7_CLAMPW_OP = torch.ops.rwkv7_clampw_v3
-        load(name="rwkv7_clampw_v3", sources=['cuda/rwkv7_clampw_v3_for_h100.cu', 'cuda/rwkv7_clampw_v3.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
-    else:
-        RWKV7_CLAMPW_OP = torch.ops.rwkv7_clampw
-        load(name="rwkv7_clampw", sources=['cuda/rwkv7_clampw.cu', 'cuda/rwkv7_clampw.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
-    class RWKV7_CLAMPW_CUDA_OP(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx,r,w,k,v,a,b):
-            B,T,H,N = r.shape
-            assert T%CHUNK_LEN == 0 # if T%CHUNK_LEN != 0: pad your input to T%CHUNK_LEN == 0, or change CHUNK_LEN (will be slower)
-            assert all(i.dtype==torch.bfloat16 for i in [r,w,k,v,a,b])
-            assert all(i.is_contiguous() for i in [r,w,k,v,a,b])
-            y = torch.empty_like(v)
-            s = torch.empty(B,H,T//CHUNK_LEN,N,N, dtype=torch.float32,device=w.device)
-            sa = torch.empty(B,T,H,N, dtype=torch.float32,device=w.device)
-            RWKV7_CLAMPW_OP.forward(r,w,k,v,a,b,y,s,sa)
-            ctx.save_for_backward(r,w,k,v,a,b,s,sa)
-            return y
-        @staticmethod
-        def backward(ctx,dy):
-            assert all(i.dtype==torch.bfloat16 for i in [dy])
-            assert all(i.is_contiguous() for i in [dy])
-            r,w,k,v,a,b,s,sa = ctx.saved_tensors
-            dr,dw,dk,dv,da,db = [torch.empty_like(x) for x in [r,w,k,v,a,b]]
-            RWKV7_CLAMPW_OP.backward(r,w,k,v,a,b,dy,s,sa,dr,dw,dk,dv,da,db)
-            return dr,dw,dk,dv,da,db
-    def RWKV7_CLAMPW_CUDA(r,w,k,v,a,b):
-        B,T,HN = r.shape
-        r,w,k,v,a,b = [i.view(B,T,HN//64,64) for i in [r,w,k,v,a,b]] # can change 64 to your HEAD_SIZE. have to hard-code the number here, or pytorch will complain
-        return RWKV7_CLAMPW_CUDA_OP.apply(r,w,k,v,a,b).view(B,T,HN)
+HEAD_SIZE = int(os.environ.get("RWKV_HEAD_SIZE", "64"))
 
 ########################################################################################################
+# CUDA Kernels
+########################################################################################################
 
-load(name="rwkv7_cmix_bf16_v5", sources=["cuda/rwkv7_cmix_bf16_v5.cpp","cuda/rwkv7_cmix_bf16_v5.cu"], extra_cflags=["-O3"],
+CHUNK_LEN = 16
+assert HEAD_SIZE == 64  # kernels below hard-code 64 in several places
+
+# check https://github.com/BlinkDL/RWKV-CUDA/blob/main/rwkv7_fast_fused/rwkv7_cuda_benchmark.py
+flags = ['-res-usage', f'-D_N_={HEAD_SIZE}', f"-D_CHUNK_LEN_={CHUNK_LEN}", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"]
+if "@rwkv3" in os.environ["RWKV_KERNEL"]:
+    RWKV7_CLAMPW_OP = torch.ops.rwkv7_clampw_v3
+    load(name="rwkv7_clampw_v3", sources=['cuda/rwkv7_clampw_v3_for_h100.cu', 'cuda/rwkv7_clampw_v3.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
+else:
+    RWKV7_CLAMPW_OP = torch.ops.rwkv7_clampw
+    load(name="rwkv7_clampw", sources=['cuda/rwkv7_clampw.cu', 'cuda/rwkv7_clampw.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
+
+class RWKV7_CLAMPW_CUDA_OP(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, r, w, k, v, a, b):
+        B, T, H, N = r.shape
+        assert T % CHUNK_LEN == 0  # pad input to T%CHUNK_LEN == 0, or change CHUNK_LEN (will be slower)
+        assert all(i.dtype == torch.bfloat16 for i in [r, w, k, v, a, b])
+        assert all(i.is_contiguous() for i in [r, w, k, v, a, b])
+        y = torch.empty_like(v)
+        s = torch.empty(B, H, T // CHUNK_LEN, N, N, dtype=torch.float32, device=w.device)
+        sa = torch.empty(B, T, H, N, dtype=torch.float32, device=w.device)
+        RWKV7_CLAMPW_OP.forward(r, w, k, v, a, b, y, s, sa)
+        ctx.save_for_backward(r, w, k, v, a, b, s, sa)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        assert all(i.dtype == torch.bfloat16 for i in [dy])
+        assert all(i.is_contiguous() for i in [dy])
+        r, w, k, v, a, b, s, sa = ctx.saved_tensors
+        dr, dw, dk, dv, da, db = [torch.empty_like(x) for x in [r, w, k, v, a, b]]
+        RWKV7_CLAMPW_OP.backward(r, w, k, v, a, b, dy, s, sa, dr, dw, dk, dv, da, db)
+        return dr, dw, dk, dv, da, db
+
+def RWKV7_CLAMPW_CUDA(r, w, k, v, a, b):
+    B, T, HN = r.shape
+    r, w, k, v, a, b = [i.view(B, T, HN // 64, 64) for i in [r, w, k, v, a, b]]  # 64 == HEAD_SIZE, hard-coded on purpose
+    return RWKV7_CLAMPW_CUDA_OP.apply(r, w, k, v, a, b).view(B, T, HN)
+
+########################################################################################################
+
+load(name="rwkv7_cmix_bf16_v5", sources=["cuda/rwkv7_cmix_bf16_v5.cpp", "cuda/rwkv7_cmix_bf16_v5.cu"], extra_cflags=["-O3"],
      extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"],
      is_python_module=False, verbose=True)
 
@@ -116,17 +112,15 @@ class _CmixLayerV2Fn(torch.autograd.Function):
 
 ########################################################################################################
 
-load(name="rwkv7_tmix_mix6_bf16_v5", sources=["cuda/rwkv7_tmix_mix6_bf16_v5.cpp","cuda/rwkv7_tmix_mix6_bf16_v5.cu"], extra_cflags=["-O3"],
+load(name="rwkv7_tmix_mix6_bf16_v5", sources=["cuda/rwkv7_tmix_mix6_bf16_v5.cpp", "cuda/rwkv7_tmix_mix6_bf16_v5.cu"], extra_cflags=["-O3"],
      extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"],
      is_python_module=False, verbose=True)
 
-from typing import Tuple
-
-def _setup_context(ctx, inputs, output):
+def _setup_context_mix6(ctx, inputs, output):
     del output
     ctx.save_for_backward(*inputs)
 
-def _backward(ctx, grads):
+def _backward_mix6(ctx, grads):
     return tuple(torch.ops.rwkv7_tmix_mix6_bf16_v5.backward(
         grads[0].contiguous(),
         grads[1].contiguous(),
@@ -139,11 +133,11 @@ def _backward(ctx, grads):
 
 torch.library.register_autograd(
     "rwkv7_tmix_mix6_bf16_v5::forward",
-    _backward,
-    setup_context=_setup_context,
+    _backward_mix6,
+    setup_context=_setup_context_mix6,
 )
 
-def _forward_op(x, x_r, x_w, x_k, x_v, x_a, x_g):
+def _forward_op_mix6(x, x_r, x_w, x_k, x_v, x_a, x_g):
     return torch.ops.rwkv7_tmix_mix6_bf16_v5.forward(
         x.contiguous(),
         x_r.contiguous(),
@@ -172,27 +166,26 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_mix6_bf16_v5_jit(x, x_r, x_w, x_k, x_v, x_a, x_g)
 else:
     def tmix_mix6_bf16_v5(x, x_r, x_w, x_k, x_v, x_a, x_g):
-        return tuple(_forward_op(x, x_r, x_w, x_k, x_v, x_a, x_g))
+        return tuple(_forward_op_mix6(x, x_r, x_w, x_k, x_v, x_a, x_g))
 
 ########################################################################################################
 
-load(name="rwkv7_tmix_kk_pre_bf16_v5", sources=["cuda/rwkv7_tmix_kk_pre_bf16_v5.cpp","cuda/rwkv7_tmix_kk_pre_bf16_v5.cu"], extra_cflags=["-O3"],
+load(name="rwkv7_tmix_kk_pre_bf16_v5", sources=["cuda/rwkv7_tmix_kk_pre_bf16_v5.cpp", "cuda/rwkv7_tmix_kk_pre_bf16_v5.cu"], extra_cflags=["-O3"],
      extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"],
      is_python_module=False, verbose=True)
 
 assert HEAD_SIZE == 64
 
-def _setup_context(ctx, inputs, output):
-     k, k_k, a, k_a, _head_size = inputs
-     inv_d = output[3]
-     ctx.save_for_backward(k, k_k, a, k_a, inv_d)
+def _setup_context_kk(ctx, inputs, output):
+    k, k_k, a, k_a, _head_size = inputs
+    inv_d = output[3]
+    ctx.save_for_backward(k, k_k, a, k_a, inv_d)
 
-def _backward(ctx, grads):
+def _backward_kk(ctx, grads):
     k, k_k, a, k_a, inv_d = ctx.saved_tensors
     grad_new_k = grads[0].contiguous()
     grad_neg_kk = grads[1].contiguous()
     grad_kka = grads[2].contiguous()
-
     return tuple(torch.ops.rwkv7_tmix_kk_pre_bf16_v5.backward(
         grad_new_k,
         grad_neg_kk,
@@ -207,11 +200,11 @@ def _backward(ctx, grads):
 
 torch.library.register_autograd(
     "rwkv7_tmix_kk_pre_bf16_v5::forward",
-    _backward,
-    setup_context=_setup_context,
+    _backward_kk,
+    setup_context=_setup_context_kk,
 )
 
-def _forward_op(k, k_k, a, k_a):
+def _forward_op_kk(k, k_k, a, k_a):
     outs = torch.ops.rwkv7_tmix_kk_pre_bf16_v5.forward(
         k.contiguous(),
         k_k.contiguous(),
@@ -242,21 +235,21 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_kk_pre_bf16_v5_jit(k, k_k, a, k_a)
 else:
     def tmix_kk_pre_bf16_v5(k, k_k, a, k_a):
-        return tuple(_forward_op(k, k_k, a, k_a))
+        return tuple(_forward_op_kk(k, k_k, a, k_a))
 
 ########################################################################################################
 
-load(name="rwkv7_tmix_lnx_rkvres_xg_bf16_v1", sources=["cuda/rwkv7_tmix_lnx_rkvres_xg_bf16_v1.cpp","cuda/rwkv7_tmix_lnx_rkvres_xg_bf16_v1.cu"], extra_cflags=["-O3"],
+load(name="rwkv7_tmix_lnx_rkvres_xg_bf16_v1", sources=["cuda/rwkv7_tmix_lnx_rkvres_xg_bf16_v1.cpp", "cuda/rwkv7_tmix_lnx_rkvres_xg_bf16_v1.cu"], extra_cflags=["-O3"],
      extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"],
      is_python_module=False, verbose=True)
 
-def _setup_context(ctx, inputs, output):
+def _setup_context_lnx(ctx, inputs, output):
     x, r, k, v, r_k, weight, bias, g = inputs
     mean = output[1]
     rstd = output[2]
     ctx.save_for_backward(x, r, k, v, r_k, weight, bias, g, mean, rstd)
 
-def _backward(ctx, grads):
+def _backward_lnx(ctx, grads):
     x, r, k, v, r_k, weight, bias, g, mean, rstd = ctx.saved_tensors
     grad_xg = grads[0].contiguous()
     return tuple(torch.ops.rwkv7_tmix_lnx_rkvres_xg_bf16_v1.backward(
@@ -275,11 +268,11 @@ def _backward(ctx, grads):
 
 torch.library.register_autograd(
     "rwkv7_tmix_lnx_rkvres_xg_bf16_v1::forward",
-    _backward,
-    setup_context=_setup_context,
+    _backward_lnx,
+    setup_context=_setup_context_lnx,
 )
 
-def _forward_op(x, r, k, v, r_k, weight, bias, g):
+def _forward_op_lnx(x, r, k, v, r_k, weight, bias, g):
     outs = torch.ops.rwkv7_tmix_lnx_rkvres_xg_bf16_v1.forward(
         x.contiguous(),
         r.contiguous(),
@@ -320,20 +313,20 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_lnx_rkvres_xg_bf16_v1_jit(x, r, k, v, r_k, weight, bias, g)
 else:
     def tmix_lnx_rkvres_xg_bf16_v1(x, r, k, v, r_k, weight, bias, g):
-        return _forward_op(x, r, k, v, r_k, weight, bias, g)
+        return _forward_op_lnx(x, r, k, v, r_k, weight, bias, g)
 
 ########################################################################################################
 
-load(name="rwkv7_tmix_a_gate_bf16", sources=["cuda/rwkv7_tmix_a_gate_bf16.cpp","cuda/rwkv7_tmix_a_gate_bf16.cu"], extra_cflags=["-O3"],
+load(name="rwkv7_tmix_a_gate_bf16", sources=["cuda/rwkv7_tmix_a_gate_bf16.cpp", "cuda/rwkv7_tmix_a_gate_bf16.cu"], extra_cflags=["-O3"],
      extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"],
      is_python_module=False, verbose=True)
 
-def _setup_context(ctx, inputs, output):
+def _setup_context_agate(ctx, inputs, output):
     del output
     a0, a12 = inputs
     ctx.save_for_backward(a0, a12)
 
-def _backward(ctx, grad_out):
+def _backward_agate(ctx, grad_out):
     a0, a12 = ctx.saved_tensors
     return tuple(torch.ops.rwkv7_tmix_a_gate_bf16.backward(
         grad_out.contiguous(),
@@ -343,11 +336,11 @@ def _backward(ctx, grad_out):
 
 torch.library.register_autograd(
     "rwkv7_tmix_a_gate_bf16::forward",
-    _backward,
-    setup_context=_setup_context,
+    _backward_agate,
+    setup_context=_setup_context_agate,
 )
 
-def _forward_op(a0, a12):
+def _forward_op_agate(a0, a12):
     return torch.ops.rwkv7_tmix_a_gate_bf16.forward(
         a0.contiguous(),
         a12.contiguous(),
@@ -368,20 +361,20 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_a_gate_bf16_jit(a0, a12)
 else:
     def tmix_a_gate_bf16(a0, a12):
-        return _forward_op(a0, a12)
+        return _forward_op_agate(a0, a12)
 
 ########################################################################################################
 
-load(name="rwkv7_tmix_vres_gate_bf16_v3", sources=["cuda/rwkv7_tmix_vres_gate_bf16_v3.cpp","cuda/rwkv7_tmix_vres_gate_bf16_v3.cu"], extra_cflags=["-O3"],
+load(name="rwkv7_tmix_vres_gate_bf16_v3", sources=["cuda/rwkv7_tmix_vres_gate_bf16_v3.cpp", "cuda/rwkv7_tmix_vres_gate_bf16_v3.cu"], extra_cflags=["-O3"],
      extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"],
      is_python_module=False, verbose=True)
 
-def _setup_context(ctx, inputs, output):
+def _setup_context_vres(ctx, inputs, output):
     del output
     v, v_first, v0, v12 = inputs
     ctx.save_for_backward(v, v_first, v0, v12)
 
-def _backward(ctx, grad_out):
+def _backward_vres(ctx, grad_out):
     v, v_first, v0, v12 = ctx.saved_tensors
     return tuple(torch.ops.rwkv7_tmix_vres_gate_bf16_v3.backward(
         grad_out.contiguous(),
@@ -393,11 +386,11 @@ def _backward(ctx, grad_out):
 
 torch.library.register_autograd(
     "rwkv7_tmix_vres_gate_bf16_v3::forward",
-    _backward,
-    setup_context=_setup_context,
+    _backward_vres,
+    setup_context=_setup_context_vres,
 )
 
-def _forward_op(v, v_first, v0, v12):
+def _forward_op_vres(v, v_first, v0, v12):
     return torch.ops.rwkv7_tmix_vres_gate_bf16_v3.forward(
         v.contiguous(),
         v_first.contiguous(),
@@ -424,73 +417,10 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_vres_gate_bf16_v3_jit(v, v_first, v0, v12)
 else:
     def tmix_vres_gate_bf16_v3(v, v_first, v0, v12):
-        return _forward_op(v, v_first, v0, v12)
+        return _forward_op_vres(v, v_first, v0, v12)
 
 ########################################################################################################
-
-L2WRAP_CE_CUDA_V2 = load(name="rwkv7_l2wrap_ce_bf16_v2", sources=["cuda/rwkv7_l2wrap_ce_bf16_v2.cpp","cuda/rwkv7_l2wrap_ce_bf16_v2.cu"], extra_cflags=["-O3"],
-     extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"],
-     verbose=True)
-
-class L2WrapCrossEntropyCUDA(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, logits, targets):
-        logits = logits.contiguous()
-        targets = targets.contiguous()
-        loss, lse, max_vals, argmax = L2WRAP_CE_CUDA_V2.forward(logits, targets)
-        ctx.save_for_backward(logits, targets.view(-1), lse, max_vals, argmax)
-        return loss
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        logits, targets, lse, max_vals, argmax = ctx.saved_tensors
-        grad_logits = L2WRAP_CE_CUDA_V2.backward(
-            grad_output.contiguous().float(),
-            logits,
-            targets,
-            lse,
-            max_vals,
-            argmax,
-        )
-        return grad_logits, None
-
-def l2wrap_cross_entropy(logits, targets):
-    return L2WrapCrossEntropyCUDA.apply(logits, targets)
-
-########################################################################################################
-
-if int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"]) > 0:
-    HEAD_L2WRAP_CE_CHUNK = int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"])
-    HEAD_L2WRAP_CE_CUDA_V4 = load(name="rwkv7_head_l2wrap_ce_bf16_v4", sources=["cuda/rwkv7_head_l2wrap_ce_bf16_v4.cpp","cuda/rwkv7_head_l2wrap_ce_bf16_v4.cu"], extra_cflags=["-O3", f"-DHEAD_CE_CHUNK={HEAD_L2WRAP_CE_CHUNK}"],
-         extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization", f"-DHEAD_CE_CHUNK={HEAD_L2WRAP_CE_CHUNK}"],
-         verbose=True)
-
-    class HeadL2WrapCrossEntropyCUDAV4(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, hidden, weight, targets):
-            hidden = hidden.contiguous()
-            weight = weight.contiguous()
-            targets = targets.contiguous()
-            loss, grad_hidden, grad_weight = HEAD_L2WRAP_CE_CUDA_V4.forward(
-                hidden,
-                weight,
-                targets,
-                HEAD_L2WRAP_CE_CHUNK,
-            )
-            ctx.save_for_backward(grad_hidden, grad_weight)
-            return loss
-
-        @staticmethod
-        def backward(ctx, grad_output):
-            grad_hidden, grad_weight = ctx.saved_tensors
-            if grad_output.numel() == 1 and float(grad_output.detach()) == 1.0:
-                return grad_hidden, grad_weight, None
-            scale = grad_output.to(dtype=torch.float32)
-            return grad_hidden * scale.to(grad_hidden.dtype), grad_weight * scale.to(grad_weight.dtype), None
-
-    def head_l2wrap_cross_entropy(hidden, weight, targets):
-        return HeadL2WrapCrossEntropyCUDAV4.apply(hidden, weight, targets)
-
+# Time mixing (attention analogue)
 ########################################################################################################
 
 class RWKV_Tmix_x070(MyModule):
@@ -539,45 +469,45 @@ class RWKV_Tmix_x070(MyModule):
             zigzag = torch.zeros(C)
             linear = torch.zeros(C)
             for n in range(C):
-                linear[n] = n / (C-1) - 0.5
-                zigzag[n] = ((n % N) - ((N-1) / 2)) / ((N-1) / 2)
+                linear[n] = n / (C - 1) - 0.5
+                zigzag[n] = ((n % N) - ((N - 1) / 2)) / ((N - 1) / 2)
                 zigzag[n] = zigzag[n] * abs(zigzag[n])
                 www[n] = -6 + 6 * (n / (C - 1)) ** (1 + 1 * ratio_0_to_1 ** 0.3)
 
-            D_DECAY_LORA = max(32, int(round(  (2.5*(C**0.5))  /32)*32)) # suggestion
+            D_DECAY_LORA = max(32, int(round((2.5 * (C ** 0.5)) / 32) * 32))  # suggestion
             self.w1 = nn.Parameter(torch.zeros(C, D_DECAY_LORA))
             self.w2 = nn.Parameter(ortho_init(torch.zeros(D_DECAY_LORA, C), 0.1))
-            self.w0 = nn.Parameter(www.reshape(1,1,C) + 0.5 + zigzag*2.5)
+            self.w0 = nn.Parameter(www.reshape(1, 1, C) + 0.5 + zigzag * 2.5)
 
-            D_AAA_LORA = max(32, int(round(  (2.5*(C**0.5))  /32)*32)) # suggestion
+            D_AAA_LORA = max(32, int(round((2.5 * (C ** 0.5)) / 32) * 32))  # suggestion
             self.a1 = nn.Parameter(torch.zeros(C, D_AAA_LORA))
             self.a2 = nn.Parameter(ortho_init(torch.zeros(D_AAA_LORA, C), 0.1))
-            self.a0 = nn.Parameter(torch.zeros(1,1,C)-0.19 + zigzag*0.3 + linear*0.4)
+            self.a0 = nn.Parameter(torch.zeros(1, 1, C) - 0.19 + zigzag * 0.3 + linear * 0.4)
 
-            D_MV_LORA = max(32, int(round(  (1.7*(C**0.5))  /32)*32)) # suggestion
+            D_MV_LORA = max(32, int(round((1.7 * (C ** 0.5)) / 32) * 32))  # suggestion
             self.v1 = nn.Parameter(torch.zeros(C, D_MV_LORA))
             self.v2 = nn.Parameter(ortho_init(torch.zeros(D_MV_LORA, C), 0.1))
-            self.v0 = nn.Parameter(torch.zeros(1,1,C)+0.73 - linear*0.4)
+            self.v0 = nn.Parameter(torch.zeros(1, 1, C) + 0.73 - linear * 0.4)
 
             # Note: for some data, you can reduce D_GATE_LORA or even remove this gate
-            D_GATE_LORA = max(32, int(round(  (5*(C**0.5))  /32)*32)) # suggestion
+            D_GATE_LORA = max(32, int(round((5 * (C ** 0.5)) / 32) * 32))  # suggestion
             self.g1 = nn.Parameter(torch.zeros(C, D_GATE_LORA))
             self.g2 = nn.Parameter(ortho_init(torch.zeros(D_GATE_LORA, C), 0.1))
 
-            self.k_k = nn.Parameter(torch.zeros(1,1,C)+0.71 - linear*0.1)
-            self.k_a = nn.Parameter(torch.zeros(1,1,C)+1.02)
-            self.r_k = nn.Parameter(torch.zeros(H,N)-0.04)
+            self.k_k = nn.Parameter(torch.zeros(1, 1, C) + 0.71 - linear * 0.1)
+            self.k_a = nn.Parameter(torch.zeros(1, 1, C) + 1.02)
+            self.r_k = nn.Parameter(torch.zeros(H, N) - 0.04)
 
             self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
             self.receptance = nn.Linear(C, C, bias=False)
             self.key = nn.Linear(C, C, bias=False)
             self.value = nn.Linear(C, C, bias=False)
             self.output = nn.Linear(C, C, bias=False)
-            self.ln_x = nn.GroupNorm(H, C, eps=64e-5) # !!! notice eps value !!!
+            self.ln_x = nn.GroupNorm(H, C, eps=64e-5)  # !!! notice eps value !!!
 
-            self.receptance.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
-            self.key.weight.data.uniform_(-0.05/(C**0.5), 0.05/(C**0.5))
-            self.value.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
+            self.receptance.weight.data.uniform_(-0.5 / (C ** 0.5), 0.5 / (C ** 0.5))
+            self.key.weight.data.uniform_(-0.05 / (C ** 0.5), 0.05 / (C ** 0.5))
+            self.value.weight.data.uniform_(-0.5 / (C ** 0.5), 0.5 / (C ** 0.5))
             self.output.weight.data.zero_()
 
     @MyFunction
@@ -608,11 +538,11 @@ class RWKV_Tmix_x070(MyModule):
         ############################################################
 
         r = self.receptance(xr)
-        w = self.w0 + torch.tanh(xw @ self.w1) @ self.w2 # will be soft-clamped to (-inf, -0.5) and exp(-exp(w)) in RWKV7_CLAMPW_CUDA kernel
+        w = self.w0 + torch.tanh(xw @ self.w1) @ self.w2  # soft-clamped to (-inf, -0.5) and exp(-exp(w)) in the clampw kernel
         k = self.key(xk)
         v = self.value(xv)
         if self.layer_id == 0:
-            v_first = v # store the v of the first layer
+            v_first = v  # store the v of the first layer
         else:
             ############################################################
             # slow pytorch version
@@ -620,7 +550,7 @@ class RWKV_Tmix_x070(MyModule):
             ############################################################
             # much faster CUDA version
             v12 = (xv @ self.v1) @ self.v2
-            v = tmix_vres_gate_bf16_v3(v, v_first, self.v0, v12) # add value residual
+            v = tmix_vres_gate_bf16_v3(v, v_first, self.v0, v12)  # add value residual
             ############################################################
 
         ############################################################
@@ -628,7 +558,7 @@ class RWKV_Tmix_x070(MyModule):
         # a = torch.sigmoid(self.a0 + (xa @ self.a1) @ self.a2) # a is "in-context learning rate"
         ############################################################
         # much faster CUDA version
-        a = tmix_a_gate_bf16(self.a0, (xa @ self.a1) @ self.a2) # a is "in-context learning rate"
+        a = tmix_a_gate_bf16(self.a0, (xa @ self.a1) @ self.a2)  # a is "in-context learning rate"
         ############################################################
 
         g = torch.sigmoid(xg @ self.g1) @ self.g2
@@ -658,20 +588,22 @@ class RWKV_Tmix_x070(MyModule):
         ############################################################
         # much faster CUDA version (!!! fixed eps=64e-5 and H=64, also fused x*g !!!)
         x = tmix_lnx_rkvres_xg_bf16_v1(
-                x,
-                r,
-                k,
-                v,
-                self.r_k,
-                self.ln_x.weight,
-                self.ln_x.bias,
-                g,
+            x,
+            r,
+            k,
+            v,
+            self.r_k,
+            self.ln_x.weight,
+            self.ln_x.bias,
+            g,
         )
         x = self.output(x)
         ############################################################
 
         return x, v_first
 
+########################################################################################################
+# Channel mixing (FFN analogue)
 ########################################################################################################
 
 # class RWKV_CMix_x070(MyModule): # slow pytorch version
@@ -680,30 +612,28 @@ class RWKV_Tmix_x070(MyModule):
 #         self.args = args
 #         self.layer_id = layer_id
 #         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
-
+#
 #         with torch.no_grad():
 #             ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
 #             ddd = torch.ones(1, 1, args.n_embd)
 #             for i in range(args.n_embd):
 #                 ddd[0, 0, i] = i / args.n_embd
 #             self.x_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
-
+#
 #         self.key = nn.Linear(args.n_embd, args.n_embd * 4, bias=False)
 #         self.value = nn.Linear(args.n_embd * 4, args.n_embd, bias=False)
-
+#
 #         self.key.weight.data.uniform_(-0.5/(args.n_embd**0.5), 0.5/(args.n_embd**0.5))
 #         self.value.weight.data.zero_()
-
+#
 #     @MyFunction
 #     def forward(self, x):
 #         xx = self.time_shift(x) - x
-
 #         k = x + xx * self.x_k
 #         k = torch.relu(self.key(k)) ** 2
-
 #         return self.value(k)
 
-class RWKV_CMix_x070(nn.Module): # fast CUDA version
+class RWKV_CMix_x070(nn.Module):  # fast CUDA version
     def __init__(self, args, layer_id):
         super().__init__()
         self.args = args
@@ -714,19 +644,19 @@ class RWKV_CMix_x070(nn.Module): # fast CUDA version
             ddd = torch.ones(1, 1, args.n_embd)
             for i in range(args.n_embd):
                 ddd[0, 0, i] = i / args.n_embd
-            self.x_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
+            self.x_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0 ** 4))
 
         self.key = nn.Linear(args.n_embd, args.n_embd * 4, bias=False)
         self.value = nn.Linear(args.n_embd * 4, args.n_embd, bias=False)
 
-        self.key.weight.data.uniform_(-0.5/(args.n_embd**0.5), 0.5/(args.n_embd**0.5))
+        self.key.weight.data.uniform_(-0.5 / (args.n_embd ** 0.5), 0.5 / (args.n_embd ** 0.5))
         self.value.weight.data.zero_()
 
     def forward(self, x):
         return _CmixLayerV2Fn.apply(x, self.x_k.view(-1), self.key.weight, self.value.weight)
 
 ########################################################################################################
-# The RWKV Model with our blocks
+# Block
 ########################################################################################################
 
 class Block(nn.Module):
@@ -754,89 +684,26 @@ class Block(nn.Module):
         x = x + self.ffn(self.ln2(x))
         return x, v_first
 
+########################################################################################################
+# The RWKV Model (plain nn.Module)
+########################################################################################################
 
-# class L2Wrap(torch.autograd.Function): # avoid: very slow and takes lots of vram
-#     @staticmethod
-#     def forward(ctx, loss, y):
-#         ctx.save_for_backward(y)
-#         return loss
-
-#     @staticmethod
-#     def backward(ctx, grad_output):
-#         y = ctx.saved_tensors[0]
-#         factor = 1e-4 / (y.shape[0] * y.shape[1])
-#         maxx, ids = torch.max(y, -1, keepdim=True)
-#         gy = torch.zeros_like(y)
-#         gy.scatter_(-1, ids, maxx * factor)
-#         return (grad_output, grad_output * gy) # original (grad_output, gy) is buggy when grad_output != 1 !!!
-
-
-class RWKV(pl.LightningModule):
+class RWKV(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        if not hasattr(args, 'dim_att'):
+        if getattr(args, 'dim_att', 0) <= 0:
             args.dim_att = args.n_embd
-        if not hasattr(args, 'dim_ffn'):
-            args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32) # default = 3.5x emb size
+        if getattr(args, 'dim_ffn', 0) <= 0:
+            args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32)  # default = 3.5x emb size
         assert args.n_embd % 32 == 0
         assert args.dim_att % 32 == 0
         assert args.dim_ffn % 32 == 0
 
         self.emb = nn.Embedding(args.vocab_size, args.n_embd)
-
         self.blocks = nn.ModuleList([Block(args, i) for i in range(args.n_layer)])
-
         self.ln_out = nn.LayerNorm(args.n_embd)
         self.head = nn.Linear(args.n_embd, args.vocab_size, bias=False)
-
-    def configure_optimizers(self):
-        args = self.args
-
-        lr_decay = set()
-        lr_1x = set()
-        lr_2x = set()
-        for n, p in self.named_parameters():
-            if ("att.w0" in n):
-                lr_2x.add(n)
-            elif (len(p.squeeze().shape) >= 2) and (args.weight_decay > 0) and (".weight" in n):
-                lr_decay.add(n)
-            else:
-                lr_1x.add(n)
-
-        lr_decay = sorted(list(lr_decay))
-        lr_1x = sorted(list(lr_1x))
-        lr_2x = sorted(list(lr_2x))
-
-        if self.trainer.is_global_zero:
-            print('decay', lr_decay, '\n')
-            print('1x', lr_1x, '\n')
-            print('2x', lr_2x, '\n')
-
-        param_dict = {n: p for n, p in self.named_parameters()}
-
-        optim_groups = [
-            {"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "my_lr_scale": 1.0},
-            {"params": [param_dict[n] for n in lr_2x], "weight_decay": 0.0, "my_lr_scale": 2.0},
-        ]
-
-        if args.weight_decay > 0:
-            optim_groups += [{"params": [param_dict[n] for n in lr_decay], "weight_decay": args.weight_decay, "my_lr_scale": 1.0}]
-            if self.deepspeed_offload:
-                return DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=True, amsgrad=False)
-            return FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=True, amsgrad=False)
-        else:
-            if self.deepspeed_offload:
-                return DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=False, weight_decay=0, amsgrad=False)
-            return FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=False, weight_decay=0, amsgrad=False)
-
-    @property
-    def deepspeed_offload(self) -> bool:
-        strategy = self.trainer.strategy
-        if isinstance(strategy, DeepSpeedStrategy):
-            cfg = strategy.config["zero_optimization"]
-            return cfg.get("offload_optimizer") or cfg.get("offload_param")
-        return False
 
     def _forward_features(self, idx):
         args = self.args
@@ -847,51 +714,23 @@ class RWKV(pl.LightningModule):
 
         v_first = torch.empty_like(x)
         for block in self.blocks:
-            if args.grad_cp == 1:
-                x, v_first = deepspeed.checkpointing.checkpoint(block, x, v_first)
+            if getattr(args, 'grad_cp', 0) == 1:
+                # was deepspeed.checkpointing.checkpoint; plain-torch equivalent
+                x, v_first = torch_checkpoint(block, x, v_first, use_reentrant=False)
             else:
                 x, v_first = block(x, v_first)
 
         x = self.ln_out(x)
         return x
 
-    if int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"]) > 0: # saves 70~80% VRAM
-
-        def forward(self, idx):
-            return self._forward_features(idx)
-
-        def training_step(self, batch, batch_idx):
-            idx, targets = batch
-            hidden = self(idx)
-            return head_l2wrap_cross_entropy(hidden, self.head.weight, targets)
-
-    else:
-
-        def forward(self, idx):
-            x = self._forward_features(idx)
-            x = self.head(x)
-            return x
-
-        def training_step(self, batch, batch_idx):
-            idx, targets = batch
-            logits = self(idx)
-
-            ############################################################
-            # slow pytorch version (!!! SLOW AND TAKES 40% MORE VRAM !!!)
-            # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-            # return L2Wrap.apply(loss, logits)
-            ############################################################
-            # much faster CUDA version (!!! fixed 1e-4 factor !!!)
-            return l2wrap_cross_entropy(logits, targets)
-
-    def training_step_end(self, batch_parts):
-        all = self.all_gather(batch_parts)
-        if self.trainer.is_global_zero:
-            self.trainer.my_loss_all = all
+    def forward(self, idx):
+        x = self._forward_features(idx)
+        x = self.head(x)
+        return x
 
     def generate_init_weight(self):
         print(
-            f"""
+            """
 ############################################################################
 #
 # Init model weight (slow for large models)...
@@ -914,7 +753,7 @@ class RWKV(pl.LightningModule):
             scale = 1.0
             if "ln_" in n or ".ln" in n or "time_" in n or "_mask" in n or "pos_emb" in n or '.mask.' in n or n.endswith('_w') or n.endswith('_w1') or n.endswith('_w2') or n.endswith('_bias') or (".weight" not in n):
                 if 'ln_x.weight' in n:
-                    layer_scale = (1+int(n.split('.')[1])) / self.args.n_layer
+                    layer_scale = (1 + int(n.split('.')[1])) / self.args.n_layer
                     m[n] = (p * 0.0) + (layer_scale ** 0.7)
                 else:
                     m[n] = p
@@ -933,14 +772,12 @@ class RWKV(pl.LightningModule):
                 nn.init.orthogonal_(m[n], gain=scale)
                 print(f" [scale {scale}]")
             else:
-                assert n.endswith('.weight') # should always be true
+                assert n.endswith('.weight')  # should always be true
 
                 zero = [".att.output.", ".ffn.value.", ".ffn.receptance.", ".ffnPre.value.", ".ffnPre.receptance.", "head_q.", '.oo.', '.rr.']
-
                 for kk in zero:
                     if kk in n:
                         scale = 0
-
                 for kk in [".att.key."]:
                     if kk in n:
                         scale = 0.1
@@ -950,7 +787,7 @@ class RWKV(pl.LightningModule):
 
                 print(f" [scale {scale}]")
 
-                if self.args.accelerator.upper() == "GPU":
+                if str(getattr(self.args, 'accelerator', 'GPU')).upper() == "GPU":
                     m[n] = torch.empty((shape[0], shape[1]), device="cuda")
                 else:
                     m[n] = torch.empty((shape[0], shape[1]))
@@ -963,13 +800,39 @@ class RWKV(pl.LightningModule):
                     nn.init.orthogonal_(m[n], gain=scale)
 
             m[n] = m[n].cpu()
-            if os.environ["RWKV_FLOAT_MODE"] == "fp16":
+            float_mode = os.environ.get("RWKV_FLOAT_MODE", "bf16")
+            if float_mode == "fp16":
                 m[n] = m[n].half()
-            elif os.environ["RWKV_FLOAT_MODE"] == "bf16":
+            elif float_mode == "bf16":
                 m[n] = m[n].bfloat16()
             n_params += m[n].numel()
 
         print('model params', n_params)
-        gc.collect()
-        torch.cuda.empty_cache()
         return m
+
+########################################################################################################
+# Minimal config + smoke usage
+########################################################################################################
+
+@dataclass
+class RWKVConfig:
+    vocab_size: int = 65536
+    ctx_len: int = 4096
+    n_layer: int = 12
+    n_embd: int = 768
+    head_size: int = 64        # must be 64 (kernels hard-code it)
+    dim_att: int = 0           # 0 -> n_embd
+    dim_ffn: int = 0           # 0 -> ~3.5x n_embd (rounded to /32)
+    grad_cp: int = 0           # 1 -> gradient checkpointing (torch.utils.checkpoint)
+    my_testing: str = "x070"
+    accelerator: str = "GPU"   # only read by generate_init_weight
+
+
+if __name__ == "__main__":
+    # requires the compiled rwkv7 CUDA kernels + a CUDA device.
+    cfg = RWKVConfig(vocab_size=65536, ctx_len=512, n_layer=6, n_embd=512)
+    model = RWKV(cfg).cuda().bfloat16()
+
+    idx = torch.randint(0, cfg.vocab_size, (1, 128), device="cuda")  # T must be a multiple of CHUNK_LEN(=16)
+    logits = model(idx)
+    print("logits:", logits.shape, logits.dtype)  # (1, 128, vocab_size)
