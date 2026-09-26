@@ -8,7 +8,7 @@ This note records the motivation, implementation, measurements, and limitations 
 
 The core idea is to preserve ROSA's exact discrete value in the forward pass while using a learned differentiable surrogate to provide a backward gradient. A small binary-sequence experiment provided an initial proof of concept: the causal Transformer surrogate matched the exact ROSA output on 96.289% of held-out positions, and a fixed-pattern upstream value projection improved from 0% to 100% exact-task accuracy using the surrogate gradient.
 
-The 100-digit addition prototype now has both a four-example overfit harness and a random-stream trainer. The latest streaming run performed 5,000 updates on 40,000 freshly generated additions with weight decay on linear projection matrices. Its best held-out token accuracy was 11.700%, and every greedy checkpoint remained 0/4 exact sums. A separate replay of the earlier no-weight-decay run completed 750 steps without reproducing its recorded NaN at step 692.
+The addition prototype has a four-example overfit harness and a configurable random-stream trainer. The 100-digit streaming run performed 5,000 updates on 40,000 fresh additions; its best held-out token accuracy was 11.700%, and every greedy checkpoint remained 0/4 exact sums. The follow-up 10-digit run was stopped after its step-4,400 metrics: held-out token accuracy peaked at 14.506% and finished at 13.768%, while every greedy check remained 0/16 exact sums. A separate replay of the earlier no-weight-decay run completed 750 steps without reproducing its recorded NaN at step 692.
 
 These results show that the prototype can train on a continuing stream, but do not show that it has learned 100-digit addition. The streaming run used only 16 fixed validation examples, one seed, and a randomly initialized small model; it did not load a pretrained RWKV checkpoint.
 
@@ -37,11 +37,11 @@ The intended deployment idea is to use the exact ROSA operator at inference. The
 | File | Purpose |
 | --- | --- |
 | [`rosa_surrogate_toy.py`](rosa_surrogate_toy.py) | Small binary-sequence experiment for exact-forward/surrogate-backward behavior, plus a controlled upstream value-projection check. |
-| [`rosa_add100_toy.py`](rosa_add100_toy.py) | Generator, token layout, and self-check for exact 100-digit addition examples. |
+| [`rosa_add100_toy.py`](rosa_add100_toy.py) | Configurable generator, token layout, and self-check for fixed-width addition examples (default: 100 digits). |
 | [`rosa_numba.py`](rosa_numba.py) | Numba-compiled exact binary ROSA implementation used to generate targets efficiently. |
 | [`rosa_add100_smoke.py`](rosa_add100_smoke.py) | One-batch CUDA smoke model: four RWKV7+ROSA blocks, a causal Transformer proxy per ROSA block, and the custom WKV7 CUDA kernel. |
 | [`rosa_add100_overfit.py`](rosa_add100_overfit.py) | Repeated-batch optimizer test with teacher-forced metrics and autoregressive greedy decoding. |
-| [`rosa_add100_stream.py`](rosa_add100_stream.py) | Random-stream trainer with held-out evaluation, greedy checks, CSV logging, checkpoints, and resume support. |
+| [`rosa_add100_stream.py`](rosa_add100_stream.py) | Configurable random-stream trainer with held-out evaluation, greedy checks, CSV logging, checkpoints, and resume support. |
 
 The four-example overfit scripts start from a fresh initialization and regenerate the same examples from seed 321. The streaming trainer saves model, optimizer, and random-number-generator state so a run can resume from its last checkpoint.
 
@@ -228,6 +228,27 @@ An earlier streaming run with seed 321, batch size 8, learning rate `1e-4`, no w
 
 The successful no-weight-decay replay metrics are in [`metrics.csv`](runs/add100_nan_repro_solo_20260926/metrics.csv). The first failed run's partial log is in [`metrics.csv`](runs/add100_stream_20260926-160413/metrics.csv).
 
+### 10-digit random-stream addition run (stopped at step 4,400)
+
+To reduce sequence length, the generator and stream trainer were parameterized by operand width. The 10-digit run used a 48-token input context, the smallest multiple of the RWKV7 chunk length (16) that fits the prompt and longest possible sum. The 48-token input is within the ROSA proxy's 304-position embedding table. Data generation was checked on 512 examples; both 10-digit and 11-digit sum lengths appeared, arithmetic and target alignment were correct, and the original 100-digit data self-check still passed.
+
+The stream used seed 321, batches of 32 fresh additions, and a fixed 128-example validation set. AdamW used learning rate `1e-4`, weight decay `0.01` on 2-D linear projection matrices only, no ROSA dropout, and 5% ROSA sign flipping. Validation loss and teacher-forced token accuracy were recorded every 100 steps. Greedy exact-sum accuracy was checked on 16 fixed validation examples every 500 steps. The run was explicitly stopped after recording step 4,400 rather than completing the planned 5,000 steps. The metrics CSV records the run through step 4,400, representing 140,800 training examples; the most recent checkpoint was saved at step 4,250.
+
+| Step | Validation task loss | Validation ROSA loss | Validation token accuracy | Greedy exact |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 2.7376 | 0.8403 | 7.858% | — |
+| 500 | 2.5779 | 0.8334 | 12.626% | 0/16 |
+| 1,000 | 2.4640 | 0.8476 | 12.626% | 0/16 |
+| 1,400 | 2.4395 | 0.8397 | **14.506% (best)** | — |
+| 2,000 | 2.4203 | 0.8515 | 13.230% | 0/16 |
+| 3,000 | 2.4192 | 0.8511 | 13.499% | 0/16 |
+| 4,000 | 2.4172 | 0.8508 | 13.163% | 0/16 |
+| 4,400 | **2.4145 (best)** | 0.8506 | 13.768% | — |
+
+The best held-out task loss was the final measured value, but the best token accuracy occurred earlier and declined afterward. All eight greedy checks from steps 500 through 4,000 produced 0/16 exact sums. Thus the shorter context improved held-out next-token metrics over initialization, but this run did not demonstrate reliable autoregressive addition or generalization. The ROSA distillation loss also ended slightly above its initial value. This is one seed and one fixed validation set; the run stopped before its planned final 600 updates.
+
+The interrupted run's metrics, last checkpoint, and console log are [`metrics.csv`](runs/add10_stream_wd_20260926/metrics.csv), [`last.pt`](runs/add10_stream_wd_20260926/last.pt), and [`add10_stream_wd_20260926.log`](runs/add10_stream_wd_20260926.log).
+
 ## Reproduction commands
 
 From the repository root:
@@ -238,6 +259,12 @@ python RWKV-v8/rosa_surrogate_toy.py
 
 # Validate 100-digit data and target alignment
 python RWKV-v8/rosa_add100_toy.py --self-check --samples 512 --seed 42
+
+# Validate the 10-digit version with its 48-token context
+python RWKV-v8/rosa_add100_toy.py --self-check --digits 10 --context-len 48 --samples 512 --seed 42
+
+# Train a 10-digit random stream (the documented run stopped early at step 4,400)
+python RWKV-v8/rosa_add100_stream.py --digits 10 --context-len 48 --steps 5000 --batch-size 32 --validation-size 128 --eval-every 100 --greedy-every 500 --greedy-size 16 --save-every 250 --learning-rate 1e-4 --weight-decay 0.01 --rosa-dropout 0 --rosa-sign-flip 0.05 --seed 321 --run-dir RWKV-v8/runs/add10_stream_wd_20260926
 
 # One-batch CUDA forward/backward/optimizer smoke test
 python RWKV-v8/rosa_add100_smoke.py

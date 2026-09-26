@@ -1,4 +1,4 @@
-"""Train RWKV7+ROSA on a fresh stream of random 100-digit additions."""
+"""Train RWKV7+ROSA on a fresh stream of random fixed-width additions."""
 
 import argparse
 import csv
@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 from torch.nn import functional as F
 
-from rosa_add100_toy import CONTEXT_LEN, VOCAB_SIZE, make_batch
+from rosa_add100_toy import CONTEXT_LEN, DIGITS, VOCAB_SIZE, make_batch
 from rosa_add100_overfit import greedy_sums, losses_and_accuracy
 from rosa_add100_smoke import (
     AdditionModel,
@@ -22,11 +22,18 @@ from rosa_add100_smoke import (
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--digits", type=int, default=DIGITS)
+    parser.add_argument(
+        "--context-len",
+        type=int,
+        help="input length; default is the smallest multiple of 16 that fits the longest sum",
+    )
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--validation-size", type=int, default=16)
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--greedy-every", type=int, default=500)
+    parser.add_argument("--greedy-size", type=int, default=4)
     parser.add_argument("--save-every", type=int, default=250)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -41,7 +48,32 @@ def main():
         help="replay the original run's behavior: apply non-finite gradients and stop at the first NaN loss",
     )
     args = parser.parse_args()
-    for name in ("steps", "batch_size", "validation_size", "eval_every", "greedy_every", "save_every"):
+    if args.digits < 1:
+        parser.error("--digits must be at least 1")
+    minimum_context = 3 * args.digits + 3
+    context_len = args.context_len
+    if context_len is None:
+        context_len = ((minimum_context + 15) // 16) * 16
+    if context_len < minimum_context:
+        parser.error(
+            f"--context-len must be at least {minimum_context} for {args.digits}-digit addition"
+        )
+    if context_len % 16:
+        parser.error("--context-len must be divisible by 16 (RWKV7 chunk length)")
+    if context_len > CONTEXT_LEN:
+        parser.error(
+            f"--context-len cannot exceed {CONTEXT_LEN}; ROSA proxy positional embeddings have that limit"
+        )
+    args.context_len = context_len
+    for name in (
+        "steps",
+        "batch_size",
+        "validation_size",
+        "eval_every",
+        "greedy_every",
+        "greedy_size",
+        "save_every",
+    ):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be at least 1")
     if args.learning_rate <= 0:
@@ -61,7 +93,7 @@ def main():
         run_dir = args.resume.resolve().parent
     elif args.run_dir is None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        run_dir = Path(__file__).resolve().parent / "runs" / f"add100_stream_{stamp}"
+        run_dir = Path(__file__).resolve().parent / "runs" / f"add{args.digits}_stream_{stamp}"
     else:
         run_dir = args.run_dir.resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -69,7 +101,8 @@ def main():
     checkpoint_path = run_dir / "last.pt"
 
     print(
-        f"run_dir={run_dir} steps={args.steps} batch={args.batch_size} "
+        f"run_dir={run_dir} digits={args.digits} context={context_len} "
+        f"steps={args.steps} batch={args.batch_size} "
         f"validation={args.validation_size} lr={args.learning_rate:g} "
         f"weight_decay={args.weight_decay:g}(linear matrices only) "
         f"rosa_dropout={args.rosa_dropout:g} sign_flip={args.rosa_sign_flip:g} "
@@ -81,7 +114,13 @@ def main():
     warmup = torch.zeros((1, 1, 1), device=DEVICE)
     exact_rosa_targets(warmup, warmup, warmup)
 
-    validation = make_batch(args.validation_size, device=DEVICE, rng=validation_rng)
+    validation = make_batch(
+        args.validation_size,
+        device=DEVICE,
+        rng=validation_rng,
+        digits=args.digits,
+        context_len=context_len,
+    )
     model = AdditionModel(
         rosa_dropout=args.rosa_dropout,
         rosa_sign_flip_p=args.rosa_sign_flip,
@@ -206,7 +245,13 @@ def main():
 
         model.train()
         for step in range(start_step + 1, args.steps + 1):
-            batch = make_batch(args.batch_size, device=DEVICE, rng=train_rng)
+            batch = make_batch(
+                args.batch_size,
+                device=DEVICE,
+                rng=train_rng,
+                digits=args.digits,
+                context_len=context_len,
+            )
             logits, surrogate_loss = model(batch["input_ids"])
             per_token = F.cross_entropy(
                 logits.reshape(-1, VOCAB_SIZE),
@@ -276,8 +321,8 @@ def main():
                 greedy_count = ""
                 do_greedy = step % args.greedy_every == 0 or step == args.steps
                 if do_greedy:
-                    greedy_examples = validation["examples"][: min(4, args.validation_size)]
-                    decoded = greedy_sums(model, greedy_examples)
+                    greedy_examples = validation["examples"][: min(args.greedy_size, args.validation_size)]
+                    decoded = greedy_sums(model, greedy_examples, context_len=context_len)
                     greedy_exact = sum(
                         predicted == expected and terminated
                         for (_, _, expected), (predicted, terminated) in zip(

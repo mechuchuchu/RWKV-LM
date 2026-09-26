@@ -40,7 +40,7 @@ def losses_and_accuracy(model, batch):
 
 
 @torch.no_grad()
-def greedy_sums(model, examples):
+def greedy_sums(model, examples, context_len=CONTEXT_LEN):
     """Autoregressively decode the answer digits, stopping at '='."""
     prompts = [
         [int(char) for char in a] + [PLUS] + [int(char) for char in b] + [EQUALS]
@@ -49,9 +49,10 @@ def greedy_sums(model, examples):
     sequences = [prompt[:] for prompt in prompts]
     finished = [False] * len(examples)
 
-    for _ in range(DIGITS + 2):  # allow a carry digit and the '=' terminator
+    max_decode_tokens = max(len(expected) for _, _, expected in examples) + 1
+    for _ in range(max_decode_tokens):  # allow the longest sum and '=' terminator
         input_ids = torch.full(
-            (len(sequences), CONTEXT_LEN), EQUALS, dtype=torch.long, device=DEVICE
+            (len(sequences), context_len), EQUALS, dtype=torch.long, device=DEVICE
         )
         for row, sequence in enumerate(sequences):
             input_ids[row, : len(sequence)] = torch.tensor(
