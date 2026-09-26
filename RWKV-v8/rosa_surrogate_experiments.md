@@ -8,9 +8,9 @@ This note records the motivation, implementation, measurements, and limitations 
 
 The core idea is to preserve ROSA's exact discrete value in the forward pass while using a learned differentiable surrogate to provide a backward gradient. A small binary-sequence experiment provided an initial proof of concept: the causal Transformer surrogate matched the exact ROSA output on 96.289% of held-out positions, and a fixed-pattern upstream value projection improved from 0% to 100% exact-task accuracy using the surrogate gradient.
 
-The 100-digit addition prototype now runs a four-block, randomly initialized RWKV7+ROSA model on exact 100-digit operands. Numba made the exact binary ROSA teacher practical for this toy run. The model can reduce teacher-forced loss on four repeated examples, but none of the configurations tested has produced a correct autoregressive sum. The best of the two 200-step configurations compared most recently—dropout 0 with a 5% ROSA sign-flip probability—reached 81.281% teacher-forced token accuracy, while greedy exact-sum accuracy remained 0/4.
+The 100-digit addition prototype now has both a four-example overfit harness and a random-stream trainer. The latest streaming run performed 5,000 updates on 40,000 freshly generated additions with weight decay on linear projection matrices. Its best held-out token accuracy was 11.700%, and every greedy checkpoint remained 0/4 exact sums. A separate replay of the earlier no-weight-decay run completed 750 steps without reproducing its recorded NaN at step 692.
 
-These results are evidence that the prototype and gradient path execute, not evidence that the model has learned general 100-digit addition. The 100-digit runs use four training examples, have no held-out arithmetic set, and do not load a pretrained RWKV checkpoint.
+These results show that the prototype can train on a continuing stream, but do not show that it has learned 100-digit addition. The streaming run used only 16 fixed validation examples, one seed, and a randomly initialized small model; it did not load a pretrained RWKV checkpoint.
 
 ## Hypothesis and gradient construction
 
@@ -41,8 +41,9 @@ The intended deployment idea is to use the exact ROSA operator at inference. The
 | [`rosa_numba.py`](rosa_numba.py) | Numba-compiled exact binary ROSA implementation used to generate targets efficiently. |
 | [`rosa_add100_smoke.py`](rosa_add100_smoke.py) | One-batch CUDA smoke model: four RWKV7+ROSA blocks, a causal Transformer proxy per ROSA block, and the custom WKV7 CUDA kernel. |
 | [`rosa_add100_overfit.py`](rosa_add100_overfit.py) | Repeated-batch optimizer test with teacher-forced metrics and autoregressive greedy decoding. |
+| [`rosa_add100_stream.py`](rosa_add100_stream.py) | Random-stream trainer with held-out evaluation, greedy checks, CSV logging, checkpoints, and resume support. |
 
-The 100-digit scripts do not save checkpoints. Each invocation starts from a fresh initialization and regenerates the same four examples from seed 321.
+The four-example overfit scripts start from a fresh initialization and regenerate the same examples from seed 321. The streaming trainer saves model, optimizer, and random-number-generator state so a run can resume from its last checkpoint.
 
 ## Binary-sequence surrogate experiment
 
@@ -202,6 +203,31 @@ The ROSA proxy loss rose between steps 100 and 200 for both configurations, even
 
 The strongest conclusion is that teacher-forced fit on four examples can improve substantially while autoregressive addition remains unsolved. The model's token accuracy and task loss do not capture error propagation through a 100-digit generated prefix, nor do they demonstrate generalization to new operands. The 200-step comparison favors dropout 0/flip 0.05 for fitting this one batch, but because this pair of runs changes both regularizers and uses one seed, it does not isolate a general causal effect.
 
+### Random-stream 100-digit addition run
+
+The streaming trainer draws a new batch of eight random 100-digit additions for every update. A separate fixed validation set of 16 additions is used for teacher-forced loss and token accuracy every 100 steps. Greedy decoding checks four validation examples every 500 steps. The run used seed 321, no ROSA dropout, a 5% ROSA sign-flip probability, and AdamW weight decay 0.01 on 2-D linear projection matrices only. Embeddings, normalization parameters, and vectors were excluded from decay.
+
+The run first trained to step 250 at learning rate `5e-5`. A non-finite gradient occurred in an exploratory continuation; training resumed from the step-250 checkpoint at `2e-5`, then paused at a step-1,000 checkpoint for the NaN replay. The completed run contains 5,000 optimizer updates and 40,000 generated training examples. The final 4,000-step segment (step 1,000 to 5,000) took 25.1 minutes on an RTX 3060 and peaked at 3.42 GiB CUDA memory; the earlier segments were run in separate sessions.
+
+| Step | Validation task loss | Validation ROSA loss | Validation token accuracy | Greedy exact |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 2.6807 | 0.8333 | 8.374% | — |
+| 1,000 | 2.3405 | 0.7807 | 9.483% | 0/4 |
+| 2,000 | 2.3375 | 0.7454 | 9.975% | 0/4 |
+| 3,000 | 2.3301 | 0.7466 | 10.099% | 0/4 |
+| 4,000 | 2.3348 | 0.7511 | 10.776% | 0/4 |
+| 5,000 | 2.3362 | 0.7508 | 10.222% | 0/4 |
+
+The lowest validation task loss was 2.3296 at step 2,600; the best token accuracy was 11.700% at step 2,500. Greedy exact accuracy was 0/4 at every checkpoint from step 500 through 5,000. The proxy's distillation loss improved from its initial value, while addition metrics stayed near their initial range. These results do not show that the model learned the addition algorithm.
+
+The final metrics and resumable checkpoint are [`metrics.csv`](runs/add100_stream_wd_resume_20260926/metrics.csv) and [`last.pt`](runs/add100_stream_wd_resume_20260926/last.pt).
+
+### Non-finite loss replay
+
+An earlier streaming run with seed 321, batch size 8, learning rate `1e-4`, no weight decay, and 5% sign flipping stopped with a non-finite loss at step 692. Replaying the same settings on an otherwise idle GPU matched the recorded step-100 metrics but diverged later and completed 750 steps without a NaN. A prior replay overlapped with the weight-decay run and also stayed finite through 1,000 steps. The failure is therefore not yet reliably reproducible; no root cause is established.
+
+The successful no-weight-decay replay metrics are in [`metrics.csv`](runs/add100_nan_repro_solo_20260926/metrics.csv). The first failed run's partial log is in [`metrics.csv`](runs/add100_stream_20260926-160413/metrics.csv).
+
 ## Reproduction commands
 
 From the repository root:
@@ -223,6 +249,24 @@ python RWKV-v8/rosa_add100_overfit.py \
 # Requested 200-step comparison, second condition
 python RWKV-v8/rosa_add100_overfit.py \
   --rosa-dropout 0 --rosa-sign-flip 0.05 --steps 200
+
+# Fresh random-stream 100-digit addition training
+python RWKV-v8/rosa_add100_stream.py \
+  --steps 5000 --batch-size 8 --weight-decay 0.01
+
+# Reproduce the staged learning-rate schedule used in the recorded run
+python RWKV-v8/rosa_add100_stream.py \
+  --steps 250 --batch-size 8 --learning-rate 5e-5 --weight-decay 0.01 \
+  --run-dir RWKV-v8/runs/add100_stream_repro
+python RWKV-v8/rosa_add100_stream.py \
+  --resume RWKV-v8/runs/add100_stream_repro/last.pt --steps 5000 \
+  --batch-size 8 --learning-rate 2e-5 --weight-decay 0.01 \
+  --run-dir RWKV-v8/runs/add100_stream_repro
+
+# Replay the earlier no-weight-decay numerical failure conditions
+python RWKV-v8/rosa_add100_stream.py \
+  --steps 750 --batch-size 8 --learning-rate 1e-4 --weight-decay 0 \
+  --rosa-sign-flip 0.05 --reproduce-unsafe-nan
 ```
 
 The 100-digit training scripts require CUDA and compile the repository's WKV7 CUDA extension on first use. The recorded environment was PyTorch `2.14.0+cu130`, CUDA `13.0`, Numba `0.67.0`, and an NVIDIA GeForce RTX 3060.
@@ -230,11 +274,11 @@ The 100-digit training scripts require CUDA and compile the repository's WKV7 CU
 ## Limitations and next measurements
 
 1. **No exact autoregressive success yet.** Every greedy checkpoint reported in the 100-digit experiments had 0/4 exact sums.
-2. **No generalization set.** The overfit harness trains and evaluates on the same four examples. A held-out random addition set has not been measured.
-3. **Tiny and stochastic comparison.** Each regularization condition has one seed and a single four-example batch. Dropout and sign flipping add stochasticity.
-4. **Only a small random-initialized model.** The prototype uses four blocks at width 128 and does not load the L4 arithmetic checkpoint or train the full RWKV model.
-5. **Proxy quality is not yet established at scale.** The small binary toy had a separate 96.289% held-out match result, but the 100-digit experiment reports only training-time ROSA distillation cross-entropy, not held-out ROSA match accuracy for learned `q/k/v` sequences.
+2. **Small generalization set.** The overfit harness evaluates on its four training examples. The streaming run used a fixed held-out set of only 16 additions, too small for a robust generalization estimate.
+3. **Single-seed results.** The streaming experiment used one seed. It does not isolate the effects of weight decay, sign flipping, or learning rate.
+4. **Small random-initialized model.** The prototype uses four blocks at width 128 and does not load the L4 arithmetic checkpoint or train a full RWKV model.
+5. **Proxy quality is not established at scale.** The small binary toy had a separate 96.289% held-out match result, but the addition experiment reports no held-out ROSA match accuracy for learned `q/k/v` sequences.
 6. **Inference path is not optimized.** `eval()` disables dropout and sign flips, and the forward value is exact ROSA, but the proxy is still evaluated. An exact-only inference path remains to be implemented and benchmarked.
-7. **Numba target generation remains CPU-side.** The current CUDA-to-CPU-to-CUDA transfer path was practical for the toy experiment; larger-scale throughput and batching need measurement.
+7. **Numba target generation remains CPU-side.** The CUDA-to-CPU-to-CUDA transfer path was practical for the toy experiment; larger-scale throughput and batching need measurement.
 
-Useful next evaluations are a held-out random addition set, multiple seeds for the two 200-step settings, and per-position greedy diagnostics (first error position, answer length, and terminator accuracy). Those would distinguish memorization, proxy approximation, and autoregressive carry/termination behavior.
+Useful next evaluations are larger held-out random addition sets, multiple seeds for the streaming run, and per-position greedy diagnostics (first error position, answer length, and terminator accuracy). Those would distinguish proxy approximation from carry and termination failures.
