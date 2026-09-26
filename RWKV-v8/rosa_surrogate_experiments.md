@@ -6,9 +6,9 @@ This note records the motivation, implementation, measurements, and limitations 
 
 ## Summary
 
-The core idea is to preserve ROSA's exact discrete value in the forward pass while using a learned differentiable surrogate to provide a backward gradient. A small binary-sequence experiment provided an initial proof of concept: the causal Transformer surrogate matched the exact ROSA output on 96.289% of held-out positions, and a fixed-pattern upstream value projection improved from 0% to 100% exact-task accuracy using the surrogate gradient.
+The core idea is to preserve ROSA's exact discrete value in the forward pass while using a learned differentiable surrogate to provide a backward gradient. A small binary-sequence experiment provided an initial proof of concept: the causal Transformer surrogate matched the exact ROSA output on 96.289% of held-out positions, and a fixed-pattern upstream value projection improved from 0% to 100% exact-task accuracy using the surrogate gradient. A focused check of the addition ROSA branch confirms bitwise exact forward values and exact gradient agreement with a direct proxy path upstream.
 
-The addition prototype has a four-example overfit harness and a configurable random-stream trainer. The 100-digit streaming run performed 5,000 updates on 40,000 fresh additions; its best held-out token accuracy was 11.700%, and every greedy checkpoint remained 0/4 exact sums. The follow-up 10-digit run was stopped after its step-4,400 metrics: held-out token accuracy peaked at 14.506% and finished at 13.768%, while every greedy check remained 0/16 exact sums. A separate replay of the earlier no-weight-decay run completed 750 steps without reproducing its recorded NaN at step 692.
+The addition prototype has a four-example overfit harness and a configurable random-stream trainer. The 100-digit streaming run performed 5,000 updates on 40,000 fresh additions; its best held-out token accuracy was 11.700%, and every greedy checkpoint remained 0/4 exact sums. The follow-up 10-digit run was stopped after its step-4,400 metrics: held-out token accuracy peaked at 14.506% and finished at 13.768%, while every greedy check remained 0/16 exact sums. A matched 1,500-step trial with proxy-gradient scale `0.5` peaked at 14.036% held-out token accuracy and also remained 0/16 on greedy checks. Its same-code scale-1 control had two skipped non-finite-gradient updates; the scale-0.5 run had none. These are single-seed exploratory comparisons.
 
 These results show that the prototype can train on a continuing stream, but do not show that it has learned 100-digit addition. The streaming run used only 16 fixed validation examples, one seed, and a randomly initialized small model; it did not load a pretrained RWKV checkpoint.
 
@@ -19,10 +19,10 @@ ROSA's binary matching operation is discrete, so its exact output does not provi
 For exact output `y_exact` and proxy output `y_proxy`, the straight-through construction is:
 
 ```python
-y = y_exact + y_proxy - y_proxy.detach()
+y = y_exact + (y_proxy - y_proxy.detach())
 ```
 
-The forward value is `y_exact`, because the last two terms cancel numerically. The backward pass sees the derivative of `y_proxy`. The proxy is also trained directly with an auxiliary cross-entropy loss against exact ROSA targets:
+The parenthesized proxy subtraction is exactly zero in the forward pass because both operands have identical values. This keeps the forward value bitwise equal to `y_exact`; the backward pass sees the derivative of `y_proxy`. The proxy is also trained directly with an auxiliary cross-entropy loss against exact ROSA targets:
 
 ```text
 total_loss = task_loss + lambda_rosa * rosa_distillation_loss
@@ -32,16 +32,50 @@ The small binary toy uses a one-hot exact output in this construction. The addit
 
 The intended deployment idea is to use the exact ROSA operator at inference. The current prototype already uses the exact result as its forward value, but it still evaluates the proxy network and constructs its proxy logits in `eval()` mode. Replacing or bypassing the proxy computation in an inference-only path has not been implemented.
 
+### Addition STE implementation check
+
+The addition ROSA branch originally computed `exact_signal + proxy_signal - proxy_signal.detach()` from left to right. A floating-point check found that this expression was not always bitwise exact: among one million random `tanh` proxy values for each exact signal (`-1` and `+1`), 117,016 and 115,789 values respectively differed from the exact signal by one FP32 ULP (maximum absolute error `5.96e-8`). The implementation now computes `exact_signal + (proxy_signal - proxy_signal.detach())`. The detached subtraction is exactly zero for the forward pass while retaining the proxy derivative. The same parenthesization was applied to the binary toy's STE expressions.
+
+The focused check in [`rosa_add_ste_check.py`](rosa_add_ste_check.py) ran the actual addition `ROSAQKV` module on CPU with a fixed `[2, 16, 8]` input, dropout and sign flips disabled, and an identity output projection to expose the STE activation. It verified that:
+
+- The forward activation was bitwise equal to the signed exact ROSA target, with both target classes present.
+- With task loss only and no distillation loss, gradients reached the input, q/k/v projections, and proxy parameters; the proxy head gradient norm was `32.0311`.
+- Input and all compared upstream/proxy parameter gradients matched the direct differentiable-proxy reference exactly (maximum absolute difference `0`).
+
+This validates the STE wiring and exact-forward behavior in the addition ROSA branch. It does not establish that the proxy approximates ROSA well or that STE solves the addition task.
+
+#### Gradient-scaled STE trial
+
+A simple STE variant scales only the task gradient through the proxy path:
+
+```python
+y = y_exact + alpha * (y_proxy - y_proxy.detach())
+```
+
+The forward value remains exactly `y_exact`; the task gradient sent through the proxy and its q/k/v inputs is multiplied by `alpha`. The auxiliary ROSA distillation loss is unchanged. The stream trainer now exposes this as `--ste-gradient-scale` (default `1.0`). The focused STE check was rerun with `alpha=0.5`; exact forward remained bitwise equal, and upstream/proxy gradients matched half of the direct proxy-path gradients exactly.
+
+For a matched comparison, two fresh 10-digit streams used the same seed (`321`), 48-token context, batch size 32, fixed validation set of 128 examples, learning rate `1e-4`, weight decay `0.01` on linear matrices, no ROSA dropout, 5% sign flipping, and 1,500 steps. Validation was recorded every 100 steps; greedy exact accuracy used the same 16 examples at steps 500, 1,000, and 1,500.
+
+| STE gradient scale | Step 500 validation loss / token accuracy | Step 1,000 validation loss / token accuracy | Step 1,500 validation loss / token accuracy | Best token accuracy through step 1,500 | Greedy at 500 / 1,000 / 1,500 | Skipped non-finite gradients |
+| ---: | --- | --- | --- | ---: | --- | ---: |
+| 1.0 | 2.4896 / 13.163% | 2.4997 / 12.827% | 2.5008 / 12.559% | 13.700% at step 300 | 0/16, 0/16, 0/16 | 2 |
+| 0.5 | 2.5829 / 11.954% | 2.4937 / 12.760% | 2.5030 / 12.895% | **14.036% at steps 1,100 and 1,300** | 0/16, 0/16, 0/16 | 0 |
+
+The half-scale run reached a slightly higher best token accuracy, while the scale-1 run had a lower best task loss (`2.4803` at step 300 versus `2.4852` at step 1,100). At step 1,500 their task losses were close, and neither configuration produced a correct greedy sum. The lower scale also had fewer observed non-finite-gradient skips in this pair, but one seed is not enough to conclude that it is more stable or generally better.
+
+The runs are [`scale 1 metrics`](runs/add10_stream_stecontrol_wd_20260926/metrics.csv), [`scale 0.5 metrics`](runs/add10_stream_stehalf_wd_20260926/metrics.csv), and their respective [`scale 1 log`](runs/add10_stream_stecontrol_wd_20260926.log) and [`scale 0.5 log`](runs/add10_stream_stehalf_wd_20260926.log). Both checkpoints are saved in the corresponding run directories.
+
 ## Experiment files
 
 | File | Purpose |
 | --- | --- |
 | [`rosa_surrogate_toy.py`](rosa_surrogate_toy.py) | Small binary-sequence experiment for exact-forward/surrogate-backward behavior, plus a controlled upstream value-projection check. |
+| [`rosa_add_ste_check.py`](rosa_add_ste_check.py) | Focused check that the addition ROSA branch is bitwise exact in the forward pass and sends the same task gradient upstream as the differentiable proxy path. |
 | [`rosa_add100_toy.py`](rosa_add100_toy.py) | Configurable generator, token layout, and self-check for fixed-width addition examples (default: 100 digits). |
 | [`rosa_numba.py`](rosa_numba.py) | Numba-compiled exact binary ROSA implementation used to generate targets efficiently. |
 | [`rosa_add100_smoke.py`](rosa_add100_smoke.py) | One-batch CUDA smoke model: four RWKV7+ROSA blocks, a causal Transformer proxy per ROSA block, and the custom WKV7 CUDA kernel. |
 | [`rosa_add100_overfit.py`](rosa_add100_overfit.py) | Repeated-batch optimizer test with teacher-forced metrics and autoregressive greedy decoding. |
-| [`rosa_add100_stream.py`](rosa_add100_stream.py) | Configurable random-stream trainer with held-out evaluation, greedy checks, CSV logging, checkpoints, and resume support. |
+| [`rosa_add100_stream.py`](rosa_add100_stream.py) | Configurable random-stream trainer with held-out evaluation, greedy checks, CSV logging, checkpoints, resume support, and proxy STE gradient scaling. |
 
 The four-example overfit scripts start from a fresh initialization and regenerate the same examples from seed 321. The streaming trainer saves model, optimizer, and random-number-generator state so a run can resume from its last checkpoint.
 
@@ -257,6 +291,9 @@ From the repository root:
 # Binary surrogate experiment
 python RWKV-v8/rosa_surrogate_toy.py
 
+# Verify exact-forward/proxy-backward behavior in the addition ROSA branch
+python RWKV-v8/rosa_add_ste_check.py
+
 # Validate 100-digit data and target alignment
 python RWKV-v8/rosa_add100_toy.py --self-check --samples 512 --seed 42
 
@@ -265,6 +302,12 @@ python RWKV-v8/rosa_add100_toy.py --self-check --digits 10 --context-len 48 --sa
 
 # Train a 10-digit random stream (the documented run stopped early at step 4,400)
 python RWKV-v8/rosa_add100_stream.py --digits 10 --context-len 48 --steps 5000 --batch-size 32 --validation-size 128 --eval-every 100 --greedy-every 500 --greedy-size 16 --save-every 250 --learning-rate 1e-4 --weight-decay 0.01 --rosa-dropout 0 --rosa-sign-flip 0.05 --seed 321 --run-dir RWKV-v8/runs/add10_stream_wd_20260926
+
+# Matched 1,500-step comparison with half-scale proxy STE gradients
+python RWKV-v8/rosa_add100_stream.py --digits 10 --context-len 48 --steps 1500 --batch-size 32 --validation-size 128 --eval-every 100 --greedy-every 500 --greedy-size 16 --save-every 250 --learning-rate 1e-4 --weight-decay 0.01 --rosa-dropout 0 --rosa-sign-flip 0.05 --ste-gradient-scale 0.5 --seed 321 --run-dir RWKV-v8/runs/add10_stream_stehalf_wd_20260926
+
+# Matched scale-1 control (default behavior)
+python RWKV-v8/rosa_add100_stream.py --digits 10 --context-len 48 --steps 1500 --batch-size 32 --validation-size 128 --eval-every 100 --greedy-every 500 --greedy-size 16 --save-every 250 --learning-rate 1e-4 --weight-decay 0.01 --rosa-dropout 0 --rosa-sign-flip 0.05 --ste-gradient-scale 1 --seed 321 --run-dir RWKV-v8/runs/add10_stream_stecontrol_wd_20260926
 
 # One-batch CUDA forward/backward/optimizer smoke test
 python RWKV-v8/rosa_add100_smoke.py

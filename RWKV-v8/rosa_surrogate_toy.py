@@ -235,13 +235,13 @@ def optimize_upstream_projection(model, device, read_index=6, steps=120):
         v_hard = v_probability.detach().gt(0.5).long()
         v_soft_input = 2 * v_probability - 1
         v_hard_input = 2 * v_hard.float() - 1
-        v_st = v_hard_input + v_soft_input - v_soft_input.detach()
+        v_st = v_hard_input + (v_soft_input - v_soft_input.detach())
 
         target = exact_targets(q, k, v_hard)
         x = torch.cat((q.float() * 2 - 1, k.float() * 2 - 1, v_st), dim=-1)
         probabilities = model(x).softmax(dim=-1)
         exact = F.one_hot(target, num_classes=2).to(probabilities.dtype)
-        y_st = exact + probabilities - probabilities.detach()
+        y_st = exact + (probabilities - probabilities.detach())
         task_logits = 8 * y_st[:, -1, 0, :]
         loss = F.cross_entropy(task_logits, labels)
 
@@ -281,7 +281,7 @@ def main():
         # Exact ROSA values are the forward activations. The surrogate supplies
         # the backward path, and the auxiliary CE trains it to match ROSA.
         exact = F.one_hot(tb, num_classes=2).to(probs.dtype)
-        rosa_with_surrogate_grad = exact + probs - probs.detach()
+        rosa_with_surrogate_grad = exact + (probs - probs.detach())
         task_logits = model.task(rosa_with_surrogate_grad[:, -1].flatten(1))
         loss_task = F.cross_entropy(task_logits, task_label(tb))
         loss_distill = F.cross_entropy(logits.flatten(0, 2), tb.flatten())

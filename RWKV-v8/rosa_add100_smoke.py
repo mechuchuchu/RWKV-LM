@@ -215,7 +215,11 @@ def exact_rosa_targets(q, k, v):
 
 class ROSAQKV(nn.Module):
     def __init__(
-        self, channels, dropout=ROSA_DROPOUT, sign_flip_p=ROSA_SIGN_FLIP_P
+        self,
+        channels,
+        dropout=ROSA_DROPOUT,
+        sign_flip_p=ROSA_SIGN_FLIP_P,
+        ste_gradient_scale=1.0,
     ):
         super().__init__()
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
@@ -230,6 +234,7 @@ class ROSAQKV(nn.Module):
         self.output = nn.Linear(channels, channels)
         self.dropout = nn.Dropout(dropout)
         self.sign_flip_p = sign_flip_p
+        self.ste_gradient_scale = ste_gradient_scale
 
     def forward(self, x):
         xx = self.time_shift(x) - x
@@ -242,7 +247,11 @@ class ROSAQKV(nn.Module):
         proxy_probs = proxy_logits.softmax(dim=-1)
         proxy_signal = proxy_probs[..., 1] - proxy_probs[..., 0]
         exact_signal = 2 * target.to(proxy_signal.dtype) - 1
-        rosa_output = exact_signal + proxy_signal - proxy_signal.detach()
+        # Subtract the identical proxy tensor before adding the exact value.
+        # This preserves the exact forward bits while keeping proxy gradients.
+        rosa_output = exact_signal + self.ste_gradient_scale * (
+            proxy_signal - proxy_signal.detach()
+        )
         if self.training and self.sign_flip_p > 0:
             flip = torch.rand_like(rosa_output) < self.sign_flip_p
             sign = torch.where(flip, -1.0, 1.0)
@@ -273,6 +282,7 @@ class Block(nn.Module):
         block_id,
         rosa_dropout=ROSA_DROPOUT,
         rosa_sign_flip_p=ROSA_SIGN_FLIP_P,
+        ste_gradient_scale=1.0,
     ):
         super().__init__()
         self.ln_rwkv = nn.LayerNorm(WIDTH)
@@ -280,7 +290,10 @@ class Block(nn.Module):
         self.ln_rosa = nn.LayerNorm(WIDTH)
         self.rwkv = RWKV7TimeMix(0 if block_id == 0 else 1)
         self.rosa = ROSAQKV(
-            WIDTH, dropout=rosa_dropout, sign_flip_p=rosa_sign_flip_p
+            WIDTH,
+            dropout=rosa_dropout,
+            sign_flip_p=rosa_sign_flip_p,
+            ste_gradient_scale=ste_gradient_scale,
         )
         self.ffn = FeedForward(WIDTH)
 
@@ -297,6 +310,7 @@ class AdditionModel(nn.Module):
         self,
         rosa_dropout=ROSA_DROPOUT,
         rosa_sign_flip_p=ROSA_SIGN_FLIP_P,
+        ste_gradient_scale=1.0,
     ):
         super().__init__()
         self.emb = nn.Embedding(VOCAB_SIZE, WIDTH)
@@ -306,6 +320,7 @@ class AdditionModel(nn.Module):
                     i,
                     rosa_dropout=rosa_dropout,
                     rosa_sign_flip_p=rosa_sign_flip_p,
+                    ste_gradient_scale=ste_gradient_scale,
                 )
                 for i in range(N_BLOCKS)
             ]

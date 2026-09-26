@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import math
 import random
 import time
 from datetime import datetime
@@ -39,6 +40,7 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--rosa-dropout", type=float, default=0.0)
     parser.add_argument("--rosa-sign-flip", type=float, default=0.05)
+    parser.add_argument("--ste-gradient-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=321)
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--resume", type=Path)
@@ -80,6 +82,8 @@ def main():
         parser.error("--learning-rate must be positive")
     if args.weight_decay < 0:
         parser.error("--weight-decay must be nonnegative")
+    if not math.isfinite(args.ste_gradient_scale) or args.ste_gradient_scale < 0:
+        parser.error("--ste-gradient-scale must be finite and nonnegative")
     if args.reproduce_unsafe_nan and args.weight_decay != 0:
         parser.error("--reproduce-unsafe-nan requires --weight-decay 0")
     if not torch.cuda.is_available():
@@ -106,6 +110,7 @@ def main():
         f"validation={args.validation_size} lr={args.learning_rate:g} "
         f"weight_decay={args.weight_decay:g}(linear matrices only) "
         f"rosa_dropout={args.rosa_dropout:g} sign_flip={args.rosa_sign_flip:g} "
+        f"ste_gradient_scale={args.ste_gradient_scale:g} "
         f"seed={args.seed}",
         flush=True,
     )
@@ -124,6 +129,7 @@ def main():
     model = AdditionModel(
         rosa_dropout=args.rosa_dropout,
         rosa_sign_flip_p=args.rosa_sign_flip,
+        ste_gradient_scale=args.ste_gradient_scale,
     ).to(DEVICE)
     decay_params = []
     no_decay_params = []
